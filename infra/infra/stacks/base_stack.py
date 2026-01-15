@@ -2,6 +2,7 @@ from aws_cdk import (
     Stack,
     Duration,
     RemovalPolicy,
+    CfnOutput,
     aws_ec2 as ec2,
     aws_ecs as ecs,
     aws_iam as iam,
@@ -11,6 +12,7 @@ from aws_cdk import (
     aws_kms as kms,
 )
 from constructs import Construct
+from aws_cdk import aws_ecr as ecr
 
 
 class BaseStack(Stack):
@@ -35,11 +37,11 @@ class BaseStack(Stack):
             self,
             "Vpc",
             max_azs=2,
-            nat_gateways=1,  # 控成本；真实生产一般 2
+            nat_gateways=1,  
         )
 
         # -----------------------------
-        # KMS Key（给 S3 / Secrets / 以后扩展用）
+        # KMS Key
         # -----------------------------
         data_key = kms.Key(
             self,
@@ -59,7 +61,7 @@ class BaseStack(Stack):
             encryption_key=data_key,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
-            auto_delete_objects=True,          # 学习项目 OK
+            auto_delete_objects=True,         
             removal_policy=RemovalPolicy.DESTROY,
         )
 
@@ -81,6 +83,15 @@ class BaseStack(Stack):
                 max_receive_count=5,
                 queue=dlq,
             ),
+        )
+
+        # -----------------------------
+        # ECR Repository (worker)   
+        # -----------------------------
+        worker_repo = ecr.Repository.from_repository_name(
+            self,
+            "WorkerRepo",
+            repository_name="mortgage-worker",
         )
 
         # -----------------------------
@@ -120,7 +131,7 @@ class BaseStack(Stack):
             )
         )
 
-        # Publisher Role（之后 outbox 用）
+        # Publisher Role（outbox）
         publisher_task_role = iam.Role(
             self,
             "PublisherTaskRole",
@@ -170,7 +181,7 @@ class BaseStack(Stack):
         )
 
         # -----------------------------
-        # Fargate Task Definitions（占位）
+        # Fargate Task Definitions
         # -----------------------------
         def make_task_def(name: str, role: iam.IRole) -> ecs.FargateTaskDefinition:
             task_def = ecs.FargateTaskDefinition(
@@ -193,7 +204,29 @@ class BaseStack(Stack):
             )
             return task_def
 
-        worker_task_def = make_task_def("Worker", worker_task_role)
+        worker_task_def = ecs.FargateTaskDefinition(
+            self,
+            "WorkerTaskDef",
+            cpu=256,
+            memory_limit_mib=512,
+            task_role=worker_task_role,
+        )
+
+        worker_task_def.add_container(
+            "WorkerContainer",
+            image=ecs.ContainerImage.from_ecr_repository(worker_repo, tag="latest"),
+            environment={
+                "QUEUE_URL": queue.queue_url,
+                "BUCKET": bucket.bucket_name,
+                "AWS_REGION": self.region,
+                "PREFIX": "raw",
+            },
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="worker", log_group=log_group),
+        )
+
+        worker_task_def.execution_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AmazonECSTaskExecutionRolePolicy")
+        )
 
         # -----------------------------
         # Security Group
@@ -206,7 +239,7 @@ class BaseStack(Stack):
         )
 
         # -----------------------------
-        # ECS Service（先跑 worker）
+        # ECS Service
         # -----------------------------
         ecs.FargateService(
             self,
@@ -220,3 +253,6 @@ class BaseStack(Stack):
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             ),
         )
+        CfnOutput(self, "PaymentsQueueUrl", value=queue.queue_url)
+        CfnOutput(self, "DataBucketName", value=bucket.bucket_name)
+
