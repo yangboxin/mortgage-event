@@ -13,6 +13,7 @@ from aws_cdk import (
 )
 from constructs import Construct
 from aws_cdk import aws_ecr as ecr
+from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 
 
 class BaseStack(Stack):
@@ -93,6 +94,14 @@ class BaseStack(Stack):
             "WorkerRepo",
             repository_name="mortgage-worker",
         )
+        # -----------------------------
+        # ECR Repository (api)
+        # -----------------------------
+        api_repo = ecr.Repository.from_repository_name(
+            self,
+            "ApiRepo",
+            repository_name="mortgage-api",
+        )
 
         # -----------------------------
         # ECS Cluster
@@ -129,6 +138,82 @@ class BaseStack(Stack):
                 actions=["sqs:SendMessage"],
                 resources=[queue.queue_arn],
             )
+        )
+        # -----------------------------
+        # API Task Definition
+        # -----------------------------
+        api_task_def = ecs.FargateTaskDefinition(
+            self,
+            "ApiTaskDef",
+            cpu=256,
+            memory_limit_mib=512,
+            task_role=api_task_role,
+        )
+
+        api_container = api_task_def.add_container(
+            "ApiContainer",
+            image=ecs.ContainerImage.from_ecr_repository(api_repo, tag="latest"),
+            environment={
+                "QUEUE_URL": queue.queue_url,
+                "AWS_REGION": self.region,
+            },
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="api", log_group=log_group),
+        )
+
+        api_container.add_port_mappings(
+            ecs.PortMapping(container_port=8080)
+        )
+        # -----------------------------
+        # ALB + Security Groups
+        # -----------------------------
+        alb_sg = ec2.SecurityGroup(
+            self,
+            "AlbSecurityGroup",
+            vpc=vpc,
+            allow_all_outbound=True,
+        )
+        alb_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "HTTP from Internet")
+
+        api_sg = ec2.SecurityGroup(
+            self,
+            "ApiServiceSecurityGroup",
+            vpc=vpc,
+            allow_all_outbound=True,
+        )
+        api_sg.add_ingress_rule(alb_sg, ec2.Port.tcp(8080), "ALB to API")
+
+        alb = elbv2.ApplicationLoadBalancer(
+            self,
+            "ApiAlb",
+            vpc=vpc,
+            internet_facing=True,
+            security_group=alb_sg,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
+        )
+
+        listener = alb.add_listener("HttpListener", port=80, open=False)
+
+        api_service = ecs.FargateService(
+            self,
+            "ApiService",
+            cluster=cluster,
+            task_definition=api_task_def,
+            desired_count=1,
+            assign_public_ip=False,
+            security_groups=[api_sg],
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+        )
+        listener.add_targets(
+            "ApiTargets",
+            port=8080,
+            targets=[api_service],
+            health_check=elbv2.HealthCheck(
+                path="/health",
+                interval=Duration.seconds(30),
+                timeout=Duration.seconds(5),
+                healthy_threshold_count=2,
+                unhealthy_threshold_count=2,
+            ),
         )
 
         # Publisher Role（outbox）
@@ -178,6 +263,11 @@ class BaseStack(Stack):
                 ],
                 resources=[data_key.key_arn],
             )
+        )
+
+        # Add execution role policy
+        api_task_def.execution_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AmazonECSTaskExecutionRolePolicy")
         )
 
         # -----------------------------
@@ -255,4 +345,6 @@ class BaseStack(Stack):
         )
         CfnOutput(self, "PaymentsQueueUrl", value=queue.queue_url)
         CfnOutput(self, "DataBucketName", value=bucket.bucket_name)
+        CfnOutput(self, "AlbDnsName", value=alb.load_balancer_dns_name)
+
 
