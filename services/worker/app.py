@@ -29,17 +29,27 @@ def main():
             body = m.get("Body", "")
             receipt = m["ReceiptHandle"]
 
-            key = f"{PREFIX}/dt={time.strftime('%Y-%m-%d')}/{uuid.uuid4().hex}.json"
-            s3.put_object(
-                Bucket=BUCKET,
-                Key=key,
-                Body=body.encode("utf-8"),
-                ContentType="application/json",
-            )
-            print(f"[worker] wrote s3://{BUCKET}/{key} body={body}", flush=True)
+            try:
+                event = json.loads(body)  # expected to be JSON
+                if "payment_id" not in event:
+                    raise ValueError("missing payment_id")
 
-            sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
-            print("[worker] deleted message", flush=True)
+                # write to S3
+                key = f"{PREFIX}/dt={time.strftime('%Y-%m-%d')}/{uuid.uuid4().hex}.json"
+                s3.put_object(
+                    Bucket=BUCKET,
+                    Key=key,
+                    Body=json.dumps(event).encode("utf-8"),
+                    ContentType="application/json",
+                )
+                print(f"[worker] wrote s3://{BUCKET}/{key} event={event}")
+
+                sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
+                print("[worker] deleted message")
+
+            except Exception as e:
+                # failed to process message, put to DLQ after max retries
+                print(f"[worker] ERROR processing message: {e}; body={body}")
 
 if __name__ == "__main__":
     main()
