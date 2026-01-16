@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+import json
 import boto3
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -42,14 +43,14 @@ def main():
                     Body=json.dumps(event).encode("utf-8"),
                     ContentType="application/json",
                 )
-                print(f"[worker] wrote s3://{BUCKET}/{key} event={event}")
+                print(f"[worker] wrote s3://{BUCKET}/{key} event={event}", flush=True)
 
                 sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=receipt)
-                print("[worker] deleted message")
+                print("[worker] deleted message", flush=True)
 
             except Exception as e:
                 # failed to process message, put to DLQ after max retries
-                print(f"[worker] ERROR processing message: {e}; body={body}")
+                print(f"[worker] ERROR processing message: {e}; body={body}", flush=True)
 
 if __name__ == "__main__":
     main()
