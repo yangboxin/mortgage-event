@@ -10,10 +10,12 @@ from aws_cdk import (
     aws_sqs as sqs,
     aws_s3 as s3,
     aws_kms as kms,
+    aws_rds as rds,
+    aws_secretsmanager as secretsmanager,
+    aws_ecr as ecr,
+    aws_elasticloadbalancingv2 as elbv2
 )
 from constructs import Construct
-from aws_cdk import aws_ecr as ecr
-from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 
 
 class BaseStack(Stack):
@@ -52,6 +54,20 @@ class BaseStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
+        # -----------------------------
+        # Secrets Manager: DB credentials
+        # -----------------------------
+        db_secret = secretsmanager.Secret(
+            self,
+            "PostgresSecret",
+            description="Credentials for Postgres RDS used by mortgage pipeline services",
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                secret_string_template='{"username":"app_user"}',
+                generate_string_key="password",
+                exclude_punctuation=True,  
+                include_space=False,
+            ),
+        )
         # -----------------------------
         # S3 Bucket（SSE-KMS）
         # -----------------------------
@@ -101,6 +117,14 @@ class BaseStack(Stack):
             self,
             "ApiRepo",
             repository_name="mortgage-api",
+        )
+        # -----------------------------
+        # ECR Repository (publisher)
+        # -----------------------------
+        publisher_repo = ecr.Repository.from_repository_name(
+            self,
+            "PublisherRepo",
+            repository_name="mortgage-publisher",
         )
 
         # -----------------------------
@@ -163,6 +187,38 @@ class BaseStack(Stack):
         api_container.add_port_mappings(
             ecs.PortMapping(container_port=8080)
         )
+
+        publisher_task_def = ecs.FargateTaskDefinition(
+            self,
+            "PublisherTaskDef",
+            cpu=256,
+            memory_limit_mib=512,
+            task_role=publisher_task_role,
+        )
+
+        publisher_task_def.add_container(
+            "PublisherContainer",
+            image=ecs.ContainerImage.from_ecr_repository(publisher_repo, tag="latest"),
+            environment={
+                "DB_HOST": db_instance.instance_endpoint.hostname,
+                "DB_PORT": str(db_instance.instance_endpoint.port),
+                "DB_NAME": db_name,
+                "QUEUE_URL": queue.queue_url,
+                "AWS_REGION": self.region,
+            },
+            secrets={
+                "DB_USER": ecs.Secret.from_secrets_manager(db_secret, field="username"),
+                "DB_PASSWORD": ecs.Secret.from_secrets_manager(db_secret, field="password"),
+            },
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="publisher", log_group=log_group),
+        )
+
+        publisher_task_def.execution_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AmazonECSTaskExecutionRolePolicy"
+            )
+        )
+
         # -----------------------------
         # ALB + Security Groups
         # -----------------------------
@@ -181,6 +237,7 @@ class BaseStack(Stack):
             allow_all_outbound=True,
         )
         api_sg.add_ingress_rule(alb_sg, ec2.Port.tcp(8080), "ALB to API")
+
 
         alb = elbv2.ApplicationLoadBalancer(
             self,
@@ -329,6 +386,23 @@ class BaseStack(Stack):
         )
 
         # -----------------------------
+        # RDS Security Group
+        # -----------------------------
+        db_sg = ec2.SecurityGroup(
+            self,
+            "DbSecurityGroup",
+            vpc=vpc,
+            description="Security group for Postgres RDS",
+            allow_all_outbound=True,
+        )
+
+        # Allow ECS services (API/Publisher/Worker) to connect to Postgres
+        db_sg.add_ingress_rule(
+            peer=service_sg,
+            connection=ec2.Port.tcp(5432),
+            description="Allow Postgres access from ECS services",
+        )
+        # -----------------------------
         # ECS Service
         # -----------------------------
         ecs.FargateService(
@@ -343,8 +417,52 @@ class BaseStack(Stack):
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             ),
         )
+        ecs.FargateService(
+            self,
+            "PublisherService",
+            cluster=cluster,
+            task_definition=publisher_task_def,
+            desired_count=1,
+            assign_public_ip=False,
+            security_groups=[service_sg],
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+        )
+
+        # -----------------------------
+        # RDS: Postgres instance (private subnets)
+        # -----------------------------
+        db_name = "mortgage"
+
+        db_instance = rds.DatabaseInstance(
+            self,
+            "Postgres",
+            engine=rds.DatabaseInstanceEngine.postgres(
+                version=rds.PostgresEngineVersion.VER_15 
+            ),
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            instance_type=ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
+            multi_az=False,              
+            allocated_storage=20,
+            max_allocated_storage=100,
+            storage_encrypted=True,
+            credentials=rds.Credentials.from_secret(db_secret),
+            database_name=db_name,
+            security_groups=[db_sg],
+            publicly_accessible=False,
+            backup_retention=Duration.days(1),
+            deletion_protection=False,
+            removal_policy=RemovalPolicy.DESTROY, 
+        )
+        # Allow tasks to read DB credentials secret
+        db_secret.grant_read(api_task_role)
+        db_secret.grant_read(publisher_task_role)
+        db_secret.grant_read(worker_task_role)
+
         CfnOutput(self, "PaymentsQueueUrl", value=queue.queue_url)
         CfnOutput(self, "DataBucketName", value=bucket.bucket_name)
         CfnOutput(self, "AlbDnsName", value=alb.load_balancer_dns_name)
-
-
+        CfnOutput(self, "DbEndpoint", value=db_instance.instance_endpoint.hostname)
+        CfnOutput(self, "DbPort", value=str(db_instance.instance_endpoint.port))
+        CfnOutput(self, "DbName", value=db_name)
+        CfnOutput(self, "DbSecretArn", value=db_secret.secret_arn)
