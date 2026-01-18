@@ -101,6 +101,60 @@ class BaseStack(Stack):
                 queue=dlq,
             ),
         )
+                # -----------------------------
+        # Security Group
+        # -----------------------------
+        service_sg = ec2.SecurityGroup(
+            self,
+            "ServiceSecurityGroup",
+            vpc=vpc,
+            allow_all_outbound=True,
+        )
+
+        # -----------------------------
+        # RDS Security Group
+        # -----------------------------
+        db_sg = ec2.SecurityGroup(
+            self,
+            "DbSecurityGroup",
+            vpc=vpc,
+            description="Security group for Postgres RDS",
+            allow_all_outbound=True,
+        )
+
+        # Allow ECS services (API/Publisher/Worker) to connect to Postgres
+        db_sg.add_ingress_rule(
+            peer=service_sg,
+            connection=ec2.Port.tcp(5432),
+            description="Allow Postgres access from ECS services",
+        )
+        
+        # -----------------------------
+        # RDS: Postgres instance (private subnets)
+        # -----------------------------
+        db_name = "mortgage"
+
+        db_instance = rds.DatabaseInstance(
+            self,
+            "Postgres",
+            engine=rds.DatabaseInstanceEngine.postgres(
+                version=rds.PostgresEngineVersion.VER_15 
+            ),
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            instance_type=ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
+            multi_az=False,              
+            allocated_storage=20,
+            max_allocated_storage=100,
+            storage_encrypted=True,
+            credentials=rds.Credentials.from_secret(db_secret),
+            database_name=db_name,
+            security_groups=[db_sg],
+            publicly_accessible=False,
+            backup_retention=Duration.days(1),
+            deletion_protection=False,
+            removal_policy=RemovalPolicy.DESTROY, 
+        )
 
         # -----------------------------
         # ECR Repository (worker)   
@@ -178,8 +232,15 @@ class BaseStack(Stack):
             "ApiContainer",
             image=ecs.ContainerImage.from_ecr_repository(api_repo, tag="latest"),
             environment={
+                "DB_HOST": db_instance.instance_endpoint.hostname,
+                "DB_PORT": str(db_instance.instance_endpoint.port),
+                "DB_NAME": db_name,
                 "QUEUE_URL": queue.queue_url,
                 "AWS_REGION": self.region,
+            },
+            secrets={
+                "DB_USER": ecs.Secret.from_secrets_manager(db_secret, field="username"),
+                "DB_PASSWORD": ecs.Secret.from_secrets_manager(db_secret, field="password"),
             },
             logging=ecs.LogDrivers.aws_logs(stream_prefix="api", log_group=log_group),
         )
@@ -188,6 +249,19 @@ class BaseStack(Stack):
             ecs.PortMapping(container_port=8080)
         )
 
+        # Publisher Role（outbox）
+        publisher_task_role = iam.Role(
+            self,
+            "PublisherTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            description="Task role for outbox publisher",
+        )
+        publisher_task_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["sqs:SendMessage"],
+                resources=[queue.queue_arn],
+            )
+        )
         publisher_task_def = ecs.FargateTaskDefinition(
             self,
             "PublisherTaskDef",
@@ -237,7 +311,11 @@ class BaseStack(Stack):
             allow_all_outbound=True,
         )
         api_sg.add_ingress_rule(alb_sg, ec2.Port.tcp(8080), "ALB to API")
-
+        db_sg.add_ingress_rule(
+            peer=api_sg,
+            connection=ec2.Port.tcp(5432),
+            description="Allow Postgres access from ALB to API",
+        )
 
         alb = elbv2.ApplicationLoadBalancer(
             self,
@@ -271,20 +349,6 @@ class BaseStack(Stack):
                 healthy_threshold_count=2,
                 unhealthy_threshold_count=2,
             ),
-        )
-
-        # Publisher Role（outbox）
-        publisher_task_role = iam.Role(
-            self,
-            "PublisherTaskRole",
-            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-            description="Task role for outbox publisher",
-        )
-        publisher_task_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["sqs:SendMessage"],
-                resources=[queue.queue_arn],
-            )
         )
 
         # Worker Role
@@ -376,33 +440,6 @@ class BaseStack(Stack):
         )
 
         # -----------------------------
-        # Security Group
-        # -----------------------------
-        service_sg = ec2.SecurityGroup(
-            self,
-            "ServiceSecurityGroup",
-            vpc=vpc,
-            allow_all_outbound=True,
-        )
-
-        # -----------------------------
-        # RDS Security Group
-        # -----------------------------
-        db_sg = ec2.SecurityGroup(
-            self,
-            "DbSecurityGroup",
-            vpc=vpc,
-            description="Security group for Postgres RDS",
-            allow_all_outbound=True,
-        )
-
-        # Allow ECS services (API/Publisher/Worker) to connect to Postgres
-        db_sg.add_ingress_rule(
-            peer=service_sg,
-            connection=ec2.Port.tcp(5432),
-            description="Allow Postgres access from ECS services",
-        )
-        # -----------------------------
         # ECS Service
         # -----------------------------
         ecs.FargateService(
@@ -428,32 +465,6 @@ class BaseStack(Stack):
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
         )
 
-        # -----------------------------
-        # RDS: Postgres instance (private subnets)
-        # -----------------------------
-        db_name = "mortgage"
-
-        db_instance = rds.DatabaseInstance(
-            self,
-            "Postgres",
-            engine=rds.DatabaseInstanceEngine.postgres(
-                version=rds.PostgresEngineVersion.VER_15 
-            ),
-            vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
-            instance_type=ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MICRO),
-            multi_az=False,              
-            allocated_storage=20,
-            max_allocated_storage=100,
-            storage_encrypted=True,
-            credentials=rds.Credentials.from_secret(db_secret),
-            database_name=db_name,
-            security_groups=[db_sg],
-            publicly_accessible=False,
-            backup_retention=Duration.days(1),
-            deletion_protection=False,
-            removal_policy=RemovalPolicy.DESTROY, 
-        )
         # Allow tasks to read DB credentials secret
         db_secret.grant_read(api_task_role)
         db_secret.grant_read(publisher_task_role)
