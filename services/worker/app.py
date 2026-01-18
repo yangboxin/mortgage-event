@@ -21,6 +21,7 @@ def main():
             MaxNumberOfMessages=5,
             WaitTimeSeconds=20,     # long polling
             VisibilityTimeout=60,
+            MessageAttributeNames=["All"],
         )
         msgs = resp.get("Messages", [])
         if not msgs:
@@ -29,7 +30,13 @@ def main():
         for m in msgs:
             body = m.get("Body", "")
             receipt = m["ReceiptHandle"]
-
+            attrs = m.get("MessageAttributes", {})
+            producer = None
+            if isinstance(attrs, dict):
+                prod = attrs.get("producer")
+                if isinstance(prod, dict):
+                    producer = prod.get("StringValue")
+            print(f"[worker] received message; MessageAttributes={attrs}; producer={producer}; ReceiptHandle={receipt}", flush=True)
             try:
                 event = json.loads(body)  # expected to be JSON
                 if "payment_id" not in event:

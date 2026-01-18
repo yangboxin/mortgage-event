@@ -30,9 +30,8 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 sqs = boto3.client("sqs", region_name=REGION)
 
 def main():
-    Base.metadata.create_all(bind=engine)
-
     print("publisher started")
+    Base.metadata.create_all(bind=engine)
 
     while True:
         db = SessionLocal()
@@ -60,8 +59,11 @@ def main():
                     sqs.send_message(
                         QueueUrl=QUEUE_URL,
                         MessageBody=str(payload) if isinstance(payload, str) else __import__("json").dumps(payload),
+                        MessageAttributes={
+                            "producer": {"DataType": "String", "StringValue": "publisher"},
+                        },
                     )
-
+                    print(f"sent event {event_id} to SQS")
                     # mark published
                     db.execute(
                         text("""
