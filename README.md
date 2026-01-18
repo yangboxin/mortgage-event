@@ -1,32 +1,18 @@
 # Mortgage Event Processing Pipeline
 
-A serverless event-driven architecture for processing mortgage payment events on AWS. This system provides a REST API to receive payment events, stores them in a queue, and processes them asynchronously to persist data in S3.
+A serverless event-driven architecture for processing mortgage payment events on AWS. This system provides a REST API to receive payment events, stores them in a queue, and processes them asynchronously to persist data in S3. An additional outbox-style `publisher` service reads pending events from Postgres (RDS) and publishes them to SQS.
 
 ## Architecture Overview
 
-```
-┌──────────────────┐
-│   API Service    │
-│  (FastAPI)       │
-└────────┬─────────┘
-         │ HTTP POST /payments
-         ▼
-┌──────────────────┐      ┌──────────────────┐
-│   ALB (ELB)      │      │   SQS Queue      │
-└────────┬─────────┘      │  (with DLQ)      │
-         │                └────────┬─────────┘
-         └────────────────────────┤
-                                  ▼
-                        ┌──────────────────┐
-                        │ Worker Service   │
-                        │  (Python)        │
-                        └────────┬─────────┘
-                                 │
-                                 ▼
-                        ┌──────────────────┐
-                        │   S3 Bucket      │
-                        │  (KMS encrypted) │
-                        └──────────────────┘
+
+<img src="diagrams/infrastructure-composer-MortgagePipelineBaseStack.yaml.png" width="900"/>
+
+### Components
+- **API Service**: FastAPI on ECS Fargate behind ALB
+- **Publisher**: Outbox-based async publisher
+- **Worker**: SQS consumer writing to S3
+- **Database**: RDS Postgres (private subnet)
+- **Messaging**: SQS + DLQ
 ```
 
 ## Project Structure
@@ -35,33 +21,30 @@ A serverless event-driven architecture for processing mortgage payment events on
 mortgage-event/
 ├── services/
 │   ├── api/                  # FastAPI service
-│   │   ├── main.py          # REST API endpoints
-│   │   ├── Dockerfile       # API container
+│   │   ├── main.py           # REST API endpoints
+│   │   ├── db.py             # DB helper (Postgres)
+│   │   ├── Dockerfile        # API container
 │   │   └── requirements.txt
-│   └── worker/              # Worker service
-│       ├── app.py           # SQS message processor
-│       ├── Dockerfile       # Worker container
+│   ├── publisher/            # Outbox publisher service
+│   │   ├── main.py           # Reads outbox_events from Postgres and sends to SQS
+│   │   ├── models.py
+│   │   ├── Dockerfile
+│   │   └── requirements.txt
+│   └── worker/               # Worker service
+│       ├── app.py            # SQS message processor
+│       ├── Dockerfile        # Worker container
 │       └── requirements.txt
 ├── infra/                    # AWS CDK Infrastructure
-│   ├── app.py               # CDK app entry point
-│   ├── cdk.json             # CDK configuration
+│   ├── app.py                # CDK app entry point
+│   ├── cdk.json              # CDK configuration
 │   ├── requirements.txt      # Python dependencies
 │   └── infra/
-│       ├── infra_stack.py   # CloudFormation stack definition
+│       ├── __init__.py
 │       └── stacks/
-│           └── base_stack.py # Base infrastructure (VPC, ECS, SQS, S3, etc.)
-├── payment.json             # Sample payment event
+│           └── base_stack.py # Base infrastructure (VPC, ECS, SQS, S3, RDS, etc.)
+├── payment.json              # Sample payment event
 └── README.md
 ```
-
-## Components
-
-### 1. API Service (`services/api/`)
-
-A FastAPI application that exposes HTTP endpoints for payment submissions.
-
-**Endpoint:**
-- `POST /payments` - Submit a new payment event
 - `GET /health` - Health check
 
 **Request Body:**
@@ -103,6 +86,38 @@ A background worker that processes payment events from the SQS queue.
 - `BUCKET` - S3 bucket name
 - `PREFIX` (default: `raw`) - S3 folder prefix
 
+### 3. Publisher Service (`services/publisher/`)
+
+A lightweight outbox publisher that reads pending rows from a Postgres `outbox_events` table and publishes them to SQS. Uses the Postgres `FOR UPDATE SKIP LOCKED` pattern to avoid concurrent processing.
+
+**Process Flow:**
+- Polls Postgres (RDS) for `status='pending'` and `available_at <= now()`
+- Sends each event to the configured SQS `QUEUE_URL`
+- On success, updates the outbox row `status='published'` and `published_at`
+- On transient failures, increments attempts and applies a backoff
+
+**Environment Variables:**
+- `DB_HOST` - Postgres host
+- `DB_PORT` - Postgres port (usually `5432`)
+- `DB_NAME` - Postgres database name
+- `DB_USER` - Postgres username (in ECS this is provided via Secrets Manager)
+- `DB_PASSWORD` - Postgres password (provided via Secrets Manager)
+- `QUEUE_URL` - SQS queue URL
+- `AWS_REGION` - AWS region
+
+**Run Locally:**
+```
+cd services/publisher
+pip install -r requirements.txt
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_NAME=mortgage
+export DB_USER=youruser
+export DB_PASSWORD=yourpw
+export QUEUE_URL=your-queue-url
+python main.py
+```
+
 ### 3. Infrastructure (`infra/`)
 
 AWS CDK stack that defines all cloud resources:
@@ -121,6 +136,12 @@ AWS CDK stack that defines all cloud resources:
 - **IAM Roles**: Task execution roles with minimal permissions
 - **CloudWatch Logs**: 1-week retention for all services
 - **ECR Repositories**: For storing API and Worker container images
+ - **ECR Repositories**: For storing API, Worker and Publisher container images
+ - **RDS (Postgres)**: Single AZ PostgreSQL instance in private subnets
+   - Engine: Postgres 15
+   - Credentials stored in AWS Secrets Manager (generated by CDK)
+   - Security group allows ECS tasks to connect on port 5432
+   - Not publicly accessible; used by API and Publisher (outbox)
 
 ## Deployment
 
@@ -172,6 +193,12 @@ cd ../worker
 docker build -t mortgage-worker:latest .
 docker tag mortgage-worker:latest "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/mortgage-worker:latest"
 docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/mortgage-worker:latest"
+
+# Build and push Publisher image
+cd ../publisher
+docker build -t mortgage-publisher:latest .
+docker tag mortgage-publisher:latest "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/mortgage-publisher:latest"
+docker push "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/mortgage-publisher:latest"
 ```
 
 ### Update ECS Services
