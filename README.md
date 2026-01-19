@@ -17,7 +17,7 @@ A serverless event-driven architecture for processing mortgage payment events on
 
 ## Project Structure
 
-```
+
 mortgage-event/
 ├── services/
 │   ├── api/                  # FastAPI service
