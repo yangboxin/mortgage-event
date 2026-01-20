@@ -1,4 +1,6 @@
 # build-and-deploy.ps1
+cd ..
+
 $AWS_REGION = "us-east-1"
 $AWS_ACCOUNT = aws sts get-caller-identity --query Account --output text
 
@@ -34,6 +36,6 @@ docker push "$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/mortgage-publisher:l
 # Deploy
 echo "[5/6] Deploying infrastructure..."
 cd ../../infra
-cdk deploy
+cdk deploy --all 
 
 echo "[6/6] Done! ✅"

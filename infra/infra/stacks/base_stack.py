@@ -42,7 +42,7 @@ class BaseStack(Stack):
             max_azs=2,
             nat_gateways=1,  
         )
-
+        self.vpc = vpc
         # -----------------------------
         # KMS Key
         # -----------------------------
@@ -53,7 +53,7 @@ class BaseStack(Stack):
             enable_key_rotation=True,
             removal_policy=RemovalPolicy.DESTROY,
         )
-
+        self.data_key = data_key
         # -----------------------------
         # Secrets Manager: DB credentials
         # -----------------------------
@@ -81,7 +81,7 @@ class BaseStack(Stack):
             auto_delete_objects=True,         
             removal_policy=RemovalPolicy.DESTROY,
         )
-
+        self.bucket = bucket
         # -----------------------------
         # SQS + DLQ
         # -----------------------------
@@ -101,8 +101,8 @@ class BaseStack(Stack):
                 queue=dlq,
             ),
         )
-                # -----------------------------
-        # Security Group
+        # -----------------------------
+        # Service Security Group
         # -----------------------------
         service_sg = ec2.SecurityGroup(
             self,
