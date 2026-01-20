@@ -13,7 +13,8 @@ from aws_cdk import (
     aws_rds as rds,
     aws_secretsmanager as secretsmanager,
     aws_ecr as ecr,
-    aws_elasticloadbalancingv2 as elbv2
+    aws_elasticloadbalancingv2 as elbv2,
+    aws_redshiftserverless as rss,
 )
 from constructs import Construct
 
@@ -69,6 +70,20 @@ class BaseStack(Stack):
             ),
         )
         # -----------------------------
+        # Secrets Manager: Redshift admin credentials
+        # -----------------------------
+        redshift_secret = secretsmanager.Secret(
+            self,
+            "RedshiftAdminSecret",
+            description="Admin credentials for Redshift Serverless",
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                secret_string_template='{"username":"rs_admin"}',
+                generate_string_key="password",
+                exclude_punctuation=True,
+                include_space=False,
+            ),
+        )
+        # -----------------------------
         # S3 Bucket（SSE-KMS）
         # -----------------------------
         bucket = s3.Bucket(
@@ -101,7 +116,7 @@ class BaseStack(Stack):
                 queue=dlq,
             ),
         )
-                # -----------------------------
+        # -----------------------------
         # Security Group
         # -----------------------------
         service_sg = ec2.SecurityGroup(
@@ -128,7 +143,6 @@ class BaseStack(Stack):
             connection=ec2.Port.tcp(5432),
             description="Allow Postgres access from ECS services",
         )
-        
         # -----------------------------
         # RDS: Postgres instance (private subnets)
         # -----------------------------
@@ -154,6 +168,17 @@ class BaseStack(Stack):
             backup_retention=Duration.days(1),
             deletion_protection=False,
             removal_policy=RemovalPolicy.DESTROY, 
+        )
+
+        # -----------------------------
+        # Redshift Serverless Security Group
+        # -----------------------------
+        redshift_sg = ec2.SecurityGroup(
+            self,
+            "RedshiftSecurityGroup",
+            vpc=vpc,
+            allow_all_outbound=True,
+            description="Security group for Redshift Serverless workgroup",
         )
 
         # -----------------------------
@@ -292,6 +317,15 @@ class BaseStack(Stack):
                 "service-role/AmazonECSTaskExecutionRolePolicy"
             )
         )
+        redshift_role = iam.Role(
+            self,
+            "RedshiftRole",
+            assumed_by=iam.ServicePrincipal("redshift.amazonaws.com"),
+            description="Role for Redshift to read S3 raw data (SSE-KMS)",
+        )
+
+        bucket.grant_read(redshift_role)
+        data_key.grant_decrypt(redshift_role)
 
         # -----------------------------
         # ALB + Security Groups
@@ -390,7 +424,10 @@ class BaseStack(Stack):
         api_task_def.execution_role.add_managed_policy(
             iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AmazonECSTaskExecutionRolePolicy")
         )
-
+        # Allow tasks to read DB credentials secret
+        db_secret.grant_read(api_task_role)
+        db_secret.grant_read(publisher_task_role)
+        db_secret.grant_read(worker_task_role)
         # -----------------------------
         # Fargate Task Definitions
         # -----------------------------
@@ -465,10 +502,38 @@ class BaseStack(Stack):
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
         )
 
-        # Allow tasks to read DB credentials secret
-        db_secret.grant_read(api_task_role)
-        db_secret.grant_read(publisher_task_role)
-        db_secret.grant_read(worker_task_role)
+        # -----------------------------
+        # Redshift Serverless: Namespace + Workgroup
+        # -----------------------------
+        namespace_name = "mortgage-ns"
+        workgroup_name = "mortgage-wg"
+
+        # Use private subnets (recommended). Redshift Serverless will create ENIs in these subnets.
+        rs_subnets = vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnets
+        rs_subnet_ids = [s.subnet_id for s in rs_subnets]
+
+        rs_namespace = rss.CfnNamespace(
+            self,
+            "MortgageRsNamespace",
+            namespace_name=namespace_name,
+            db_name="analytics",
+            admin_username=redshift_secret.secret_value_from_json("username").unsafe_unwrap(),
+            admin_user_password=redshift_secret.secret_value_from_json("password").unsafe_unwrap(),
+            iam_roles=[redshift_role.role_arn],
+        )
+
+        rs_workgroup = rss.CfnWorkgroup(
+            self,
+            "MortgageRsWorkgroup",
+            workgroup_name=workgroup_name,
+            namespace_name=namespace_name,
+            subnet_ids=rs_subnet_ids,
+            security_group_ids=[redshift_sg.security_group_id],
+            publicly_accessible=False,  # keep private
+        )
+
+        # Ensure workgroup is created after namespace
+        rs_workgroup.add_dependency(rs_namespace)
 
         CfnOutput(self, "PaymentsQueueUrl", value=queue.queue_url)
         CfnOutput(self, "DataBucketName", value=bucket.bucket_name)
@@ -477,3 +542,6 @@ class BaseStack(Stack):
         CfnOutput(self, "DbPort", value=str(db_instance.instance_endpoint.port))
         CfnOutput(self, "DbName", value=db_name)
         CfnOutput(self, "DbSecretArn", value=db_secret.secret_arn)
+        CfnOutput(self, "RedshiftNamespaceName", value=namespace_name)
+        CfnOutput(self, "RedshiftWorkgroupName", value=workgroup_name)
+        CfnOutput(self, "RedshiftAdminSecretArn", value=redshift_secret.secret_arn)
