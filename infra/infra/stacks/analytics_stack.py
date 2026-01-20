@@ -74,6 +74,9 @@ class AnalyticsStack(Stack):
             assumed_by=iam.ServicePrincipal("sagemaker.amazonaws.com"),
             description="Execution role for SageMaker Processing + Batch Transform",
         )
+        sm_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name("AmazonSageMakerFullAccess")
+        )
 
         # S3 read/write (SSE-KMS bucket) + KMS
         bucket.grant_read_write(sm_role)
@@ -94,6 +97,11 @@ class AnalyticsStack(Stack):
                 security_group_ids=sm_sg_ids,
                 subnets=sm_subnet_ids,
             ),
+        )
+        sm_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "AmazonEC2ContainerRegistryReadOnly"
+            )
         )
 
         # -----------------------------
